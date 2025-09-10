@@ -58,6 +58,7 @@ class ApiSportsClient {
       current: number;
       usedToday: { [key: string]: number };
       lastReset: Date;
+      suspendedKeys: Set<string>; // Заблокированные ключи
     };
   } = {};
 
@@ -74,7 +75,8 @@ class ApiSportsClient {
         keys: apiKeys,
         current: 0,
         usedToday: {},
-        lastReset: new Date()
+        lastReset: new Date(),
+        suspendedKeys: new Set<string>()
       };
     });
   }
@@ -135,70 +137,71 @@ class ApiSportsClient {
   }
 
 
-  // Проверка статуса ключа через /status endpoint (БЕЗ трат лимитов!)
+  // Проверка статуса ключа через реальный запрос (может тратить лимиты!)
   private async checkKeyStatusViaAPI(sport: string, key: string): Promise<boolean> {
     try {
       const baseUrl = this.endpoints[sport as keyof typeof this.endpoints];
       
-      // Используем /status endpoint который НЕ тратит лимиты
-      console.log(`🌐 Checking key ${key.substring(0, 8)}... with /status endpoint (no quota used)`);
+      // Используем минимальный реальный запрос чтобы проверить блокировку аккаунта
+      console.log(`🌐 Checking key ${key.substring(0, 8)}... with real request (may use quota)`);
       
-      const response = await axios.get(`${baseUrl}/status`, {
+      let testEndpoint = '';
+      if (sport === 'football') {
+        testEndpoint = '/fixtures?live=all';
+      } else {
+        testEndpoint = '/games?live=all';
+      }
+      
+      const response = await axios.get(`${baseUrl}${testEndpoint}`, {
         headers: {
           'x-apisports-key': key
         },
         timeout: 8000
       });
 
-      // Проверяем ошибки API - если есть ошибка лимита, ключ исчерпан
-      if (response.data && response.data.errors && response.data.errors.requests) {
-        const errorMessage = response.data.errors.requests;
-        
-        if (errorMessage.includes('request limit') || errorMessage.includes('reached the limit')) {
-          console.warn(`❌ Key ${key.substring(0, 8)}... EXHAUSTED: ${errorMessage}`);
+      // Проверяем ошибки блокировки аккаунта
+      if (response.data && response.data.errors) {
+        if (response.data.errors.access) {
+          console.warn(`❌ Key ${key.substring(0, 8)}... SUSPENDED: ${response.data.errors.access}`);
+          // Добавляем ключ в список заблокированных для всех видов спорта
+          Object.keys(this.keyRotation).forEach(sportName => {
+            this.keyRotation[sportName].suspendedKeys.add(key);
+          });
+          
+          // Обновляем интервал при изменении количества доступных ключей
+          this.onKeysUpdated();
           return false;
         }
-      }
-      
-      // Если есть response с данными аккаунта - проверяем лимиты
-      if (response.data && response.data.response && Array.isArray(response.data.response) && response.data.response.length > 0) {
-        const accountData = response.data.response[0];
-        if (accountData.requests) {
-          const used = accountData.requests.current || 0;
-          const limit = accountData.requests.limit_day || 100;
-          
-          console.log(`🔍 Key Status: ${key.substring(0, 8)}... used: ${used}/${limit} requests (from /status endpoint)`);
-          
-          // Переключаемся когда использовано 99 или больше запросов
-          if (used >= 99) {
-            console.warn(`⚠️ Key ${key.substring(0, 8)}... has used ${used} requests - switching to next key`);
+        
+        if (response.data.errors.requests) {
+          const errorMessage = response.data.errors.requests;
+          if (errorMessage.includes('request limit') || errorMessage.includes('reached the limit')) {
+            console.warn(`❌ Key ${key.substring(0, 8)}... EXHAUSTED: ${errorMessage}`);
             return false;
           }
-          
-          return used < 99;
         }
       }
       
-      // Если нет ошибок и статус 200, ключ доступен
-      console.log(`✅ Key ${key.substring(0, 8)}... appears to be available (no rate limit errors)`);
+      // Если нет ошибок блокировки, ключ работает
+      console.log(`✅ Key ${key.substring(0, 8)}... is working (no suspension/block errors)`);
       return true;
       
     } catch (error: any) {
-      console.log(`❌ Key status check failed: ${key.substring(0, 8)}... - ${error.response?.status || error.message}`);
+      console.log(`❌ Key check failed: ${key.substring(0, 8)}... - ${error.response?.status || error.message}`);
       
-      // Если получили 429, ключ точно исчерпан
+      // Если получили 429, ключ исчерпан
       if (error.response?.status === 429) {
-        console.warn(`🚫 Key ${key.substring(0, 8)}... returned 429 on /status - exhausted`);
+        console.warn(`🚫 Key ${key.substring(0, 8)}... returned 429 - exhausted`);
         return false;
       }
       
-      // При других ошибках (403, 401 и т.д.) ключ может быть недействительным
+      // При других ошибках (403, 401 и т.д.) ключ недействителен
       if (error.response?.status === 403 || error.response?.status === 401) {
-        console.warn(`⚠️ Key ${key.substring(0, 8)}... returned ${error.response.status} - invalid key`);
+        console.warn(`⚠️ Key ${key.substring(0, 8)}... returned ${error.response.status} - invalid/suspended`);
         return false;
       }
       
-      // При других ошибках (сетевых) не помечаем ключ как исчерпанный
+      // При сетевых ошибках не помечаем как недоступный
       return true;
     }
   }
@@ -213,17 +216,32 @@ class ApiSportsClient {
       return null;
     }
 
+    // Пропускаем заблокированные ключи
+    const availableKeys = rotation.keys.filter(key => !rotation.suspendedKeys.has(key));
+    if (availableKeys.length === 0) {
+      console.warn(`❌ All keys for ${sport} are suspended`);
+      return null;
+    }
+
     let attempts = 0;
     const startIndex = rotation.current;
 
-    console.log(`🔍 Finding available key for ${sport}. Starting from index ${startIndex}`);
+    console.log(`🔍 Finding available key for ${sport}. Available: ${availableKeys.length}/${rotation.keys.length} keys`);
 
     while (attempts < rotation.keys.length) {
       const currentKey = rotation.keys[rotation.current];
       
+      // Пропускаем заблокированные ключи
+      if (rotation.suspendedKeys.has(currentKey)) {
+        console.log(`⏭️ Skipping suspended key ${rotation.current + 1}/${rotation.keys.length} for ${sport}: ${currentKey.substring(0, 8)}...`);
+        this.switchToNextKey(sport);
+        attempts++;
+        continue;
+      }
+      
       console.log(`🔑 Checking key ${rotation.current + 1}/${rotation.keys.length} for ${sport}: ${currentKey.substring(0, 8)}...`);
       
-      // Проверяем статус через API перед каждым использованием
+      // Проверяем статус только если ключ не заблокирован
       const isAvailable = await this.checkKeyStatusViaAPI(sport, currentKey);
       
       if (isAvailable) {
@@ -287,6 +305,41 @@ class ApiSportsClient {
     }
   }
 
+  // Получить количество рабочих (незаблокированных) ключей
+  public getWorkingKeysCount(): number {
+    const rotation = this.keyRotation['football']; // Используем любой спорт, так как ключи общие
+    const workingKeys = rotation.keys.filter(key => !rotation.suspendedKeys.has(key));
+    return workingKeys.length;
+  }
+
+  // Получить динамический интервал обновления в зависимости от количества ключей
+  public getUpdateInterval(): number {
+    const workingKeysCount = this.getWorkingKeysCount();
+    
+    if (workingKeysCount >= 3) {
+      return 5; // 5 минут
+    } else if (workingKeysCount === 2) {
+      return 10; // 10 минут
+    } else if (workingKeysCount === 1) {
+      return 15; // 15 минут
+    } else {
+      return 30; // 30 минут если ключей нет
+    }
+  }
+
+  // Обработчик изменения ключей (вызывается LiveFeedService)
+  private onKeysUpdatedCallback?: () => void;
+  
+  public setOnKeysUpdatedCallback(callback: () => void): void {
+    this.onKeysUpdatedCallback = callback;
+  }
+  
+  private onKeysUpdated(): void {
+    if (this.onKeysUpdatedCallback) {
+      this.onKeysUpdatedCallback();
+    }
+  }
+
   // Получить статус всех ключей (для отладки)
   public getKeysStatus(sport?: string): any {
     if (sport) {
@@ -294,11 +347,14 @@ class ApiSportsClient {
       return {
         sport,
         currentIndex: rotation.current,
+        workingKeys: this.getWorkingKeysCount(),
+        updateInterval: this.getUpdateInterval(),
         keys: rotation.keys.map((key, index) => ({
           index: index + 1,
           key: key.substring(0, 8) + '...',
           usage: rotation.usedToday[key] || 0,
-          available: (rotation.usedToday[key] || 0) < 100
+          suspended: rotation.suspendedKeys.has(key),
+          available: (rotation.usedToday[key] || 0) < 100 && !rotation.suspendedKeys.has(key)
         }))
       };
     }
@@ -831,9 +887,31 @@ class LiveFeedService {
     }
   }
 
+  // Настройка интервала обновления пула
+  private setupPoolUpdateInterval(): void {
+    // Очищаем старый интервал если есть
+    if (this.poolUpdateInterval) {
+      clearInterval(this.poolUpdateInterval);
+    }
+    
+    const interval = this.apiSportsClient.getUpdateInterval();
+    const poolJitter = Math.random() * 10000; // ±5 сек
+    
+    this.poolUpdateInterval = setInterval(() => {
+      this.updateMatchPool();
+    }, interval * 60000 + poolJitter);
+    
+    console.log(`🔄 Pool update interval set to ${interval} minutes (${this.apiSportsClient.getWorkingKeysCount()} working keys)`);
+  }
+
   // Запуск сервиса
   async start(): Promise<void> {
     console.log('Starting Live Feed Service...');
+    
+    // Устанавливаем callback для автоматического обновления интервала
+    this.apiSportsClient.setOnKeysUpdatedCallback(() => {
+      this.setupPoolUpdateInterval();
+    });
     
     // Инициализируем ключи через API проверку
     await this.apiSportsClient.initializeKeys();
@@ -841,13 +919,8 @@ class LiveFeedService {
     // Сразу обновляем пул
     this.updateMatchPool();
     
-    // Настраиваем интервалы
-    
-    // Обновление пула матчей каждые 5 минут с небольшим джиттером
-    const poolJitter = Math.random() * 10000; // ±5 сек
-    this.poolUpdateInterval = setInterval(() => {
-      this.updateMatchPool();
-    }, 5 * 60000 + poolJitter);
+    // Настраиваем динамический интервал обновления пула
+    this.setupPoolUpdateInterval();
     
     // Обновление времени матчей каждые 30 секунд
     this.timeCheckInterval = setInterval(() => {
@@ -856,7 +929,7 @@ class LiveFeedService {
     }, 30 * 1000);
     
     console.log('Live Feed Service started:');
-    console.log('- Match pool updates: every 5 minutes');
+    console.log(`- Match pool updates: every ${this.apiSportsClient.getUpdateInterval()} minutes (dynamic based on working keys)`);
     console.log('- Match timing updates: every 30 seconds');
     console.log('- Football: LIVE matches only');
     console.log('- Other sports: LIVE and upcoming matches');
