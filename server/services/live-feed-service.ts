@@ -65,7 +65,7 @@ class ApiSportsClient {
   constructor() {
     // Инициализация ротации ключей для каждого спорта
     const apiKeys = [
-      'f8fd2d6b04b56bb581f0b24bc14bbfe8',
+      '8d05e41071271be7ccbd6adb7c61378f',
       '50a1f9fee7f5eb0170ac4cad898346e7',
       '4e9ec8feebcad1443105a39f63703fac'
     ];
